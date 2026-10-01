@@ -539,12 +539,19 @@ run_non_shardable_tests() {
 			-t zdtm/static/seccomp_no_new_privs
 		)
 		CUDA_CONFIG=$(mktemp)
+		cuda_zdtm_status=0
 		for backend in driver-api cuda-checkpoint; do
 			echo "plugin-option cuda_plugin.backend=$backend" >"$CUDA_CONFIG"
-			CRIU_CONFIG_FILE="$CUDA_CONFIG" ./test/zdtm.py run "${CUDA_ZDTM_TESTS[@]}" \
-				--mocked-cuda-checkpoint --fault 138
+			# One run per flavor: zdtm stops the flavors of a test at the
+			# first one that fails.
+			for flavor in h ns uns; do
+				CRIU_CONFIG_FILE="$CUDA_CONFIG" ./test/zdtm.py run "${CUDA_ZDTM_TESTS[@]}" \
+					-f "$flavor" --mocked-cuda-checkpoint --fault 138 --keep-going ||
+					cuda_zdtm_status=1
+			done
 		done
 		rm -f "$CUDA_CONFIG"
+		[ "$cuda_zdtm_status" -eq 0 ]
 		./test/cuda-checkpoint/checkpoint-error-rollback.sh
 		python3 ./test/cuda-checkpoint/backend-errors.py
 		./test/cuda-checkpoint/backend-selection.sh
