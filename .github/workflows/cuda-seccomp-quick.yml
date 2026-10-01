@@ -1,0 +1,191 @@
+# Quick check of the mocked CUDA seccomp tests for fork branches. It is not
+# meant for upstream: push it only to ci4-* branches of a fork.
+#
+# A1: the CUDA ZDTM run of run-ci-tests.sh (sigpending, pthread00 and the
+#     seccomp tests with the mocked CUDA plugin), once per backend, as root.
+#     Each flavor runs separately: zdtm stops the flavors of a test at the
+#     first one that fails.
+# A2: pthread00 with --rootless and the cuda-checkpoint backend, as in the
+#     non-root Fedora job of lima.sh. criu gets cap_sys_ptrace in addition to
+#     cap_checkpoint_restore because Yama's ptrace_scope is 1 on Ubuntu (as in
+#     the rootless block of run-ci-tests.sh); neither is CAP_SYS_ADMIN.
+# Both run with --keep-going and -k always, and the dump and restore logs are
+# checked for the backend selection and the restore thread handling.
+name: CUDA seccomp quick check (fork only)
+
+on:
+  push:
+    branches:
+      - 'ci4-*'
+  workflow_dispatch:
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  cuda-seccomp:
+    name: CUDA seccomp quick check (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Install dependencies
+      run: |
+        sudo contrib/dependencies/apt-packages.sh
+        sudo contrib/apt-install gcc gcc-multilib libcap2-bin
+
+    - name: Build CRIU and the ZDTM tests
+      run: |
+        sudo make -j"$(nproc)"
+        sudo make -j"$(nproc)" -C test/zdtm
+
+    - name: Prepare the runner
+      run: |
+        uname -a
+        # Some ZDTM tests run as other users (as in run-ci-tests.sh).
+        d=$(pwd -P)
+        while [ "$d" != / ]; do
+          sudo chmod o+x "$d"
+          d=$(dirname "$d")
+        done
+        sudo chmod 0777 test/ test/zdtm/static test/zdtm/transition
+        # Ubuntu 24.04 restricts user namespaces (as in run-ci-tests.sh).
+        sudo sysctl kernel.apparmor_restrict_unprivileged_userns=0 || :
+        echo "ptrace_scope: $(cat /proc/sys/kernel/yama/ptrace_scope || :)"
+        for feature in seccomp_suspend seccomp_filters; do
+          if sudo ./criu/criu check --feature "$feature"; then
+            echo "criu check --feature $feature: OK"
+          else
+            echo "::warning::criu check --feature $feature failed"
+          fi
+        done
+        mkdir -p "$RUNNER_TEMP/logs"
+
+    - name: A1, mocked CUDA ZDTM tests with both backends as root
+      run: |
+        status=0
+        for backend in driver-api cuda-checkpoint; do
+          conf=/tmp/criu-cuda-$backend.conf
+          echo "plugin-option cuda_plugin.backend=$backend" > "$conf"
+          sudo rm -rf test/dump
+          for flavor in h ns uns; do
+            log=$RUNNER_TEMP/logs/a1-$backend-$flavor.txt
+            sudo env CRIU_CONFIG_FILE="$conf" ./test/zdtm.py run \
+              -t zdtm/static/sigpending \
+              -t zdtm/static/pthread00 \
+              -t zdtm/static/seccomp_strict \
+              -t zdtm/static/seccomp_filter \
+              -t zdtm/static/seccomp_filter_tsync \
+              -t zdtm/static/seccomp_filter_threads \
+              -t zdtm/static/seccomp_filter_inheritance \
+              -t zdtm/static/seccomp_no_new_privs \
+              -f "$flavor" --mocked-cuda-checkpoint --fault 138 --keep-going -k always \
+              2>&1 | tee "$log" || status=1
+            if grep "^Skipping zdtm/" "$log"; then
+              echo "::error::tests were skipped with the $backend backend in the $flavor flavor"
+              status=1
+            fi
+          done
+          sudo mv test/dump "$RUNNER_TEMP/logs/a1-$backend-dump" || status=1
+        done
+        exit "$status"
+
+    - name: A2, rootless pthread00 with the cuda-checkpoint backend
+      if: always()
+      run: |
+        conf=/tmp/criu-cuda-rootless.conf
+        echo "plugin-option cuda_plugin.backend=cuda-checkpoint" > "$conf"
+        chmod a+r "$conf"
+        sudo rm -rf test/dump
+        # The test and criu run as uid 65534.
+        sudo chmod -R a+rwX .
+        sudo setcap cap_checkpoint_restore,cap_sys_ptrace+eip criu/criu
+        status=0
+        sudo env CRIU_CONFIG_FILE="$conf" ./test/zdtm.py run \
+          -t zdtm/static/pthread00 -f h --rootless \
+          --mocked-cuda-checkpoint --fault 138 --keep-going -k always \
+          2>&1 | tee "$RUNNER_TEMP/logs/a2.txt" || status=1
+        sudo setcap -r criu/criu
+        sudo mv test/dump "$RUNNER_TEMP/logs/a2-dump" || status=1
+        exit "$status"
+
+    - name: Check that the plugin handled the tasks
+      if: always()
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/logs"
+        status=0
+        check() {
+          local dir=$1 name=$2 n=0 log pattern
+          if [ ! -d "$dir" ]; then
+            echo "::error::$dir is missing"
+            status=1
+            return
+          fi
+          while IFS= read -r -d '' log; do
+            n=$((n + 1))
+            if ! grep -q "cuda_plugin: selected $name backend for stage" "$log"; then
+              echo "::error::no $name backend selection in $log"
+              status=1
+            fi
+            case $log in
+            */dump.log) pattern="Checkpointing CUDA devices on pid [0-9]* restore_tid [0-9]*" ;;
+            *) pattern="Restore thread pid [0-9]* found for real pid [0-9]*" ;;
+            esac
+            if ! grep -q "$pattern" "$log"; then
+              echo "::error::no restore thread handling in $log"
+              status=1
+            fi
+          done < <(find "$dir" \( -name dump.log -o -name restore.log \) -print0 | sort -z)
+          echo "$dir: $n dump and restore logs checked"
+          if [ "$n" -eq 0 ]; then
+            echo "::error::no dump or restore logs in $dir"
+            status=1
+          fi
+        }
+        check "$RUNNER_TEMP/logs/a1-driver-api-dump" "Driver API"
+        check "$RUNNER_TEMP/logs/a1-cuda-checkpoint-dump" "cuda-checkpoint CLI"
+        check "$RUNNER_TEMP/logs/a2-dump" "cuda-checkpoint CLI"
+        exit "$status"
+
+    - name: Run the CUDA seccomp test scripts as root, if the tree has them
+      if: always()
+      run: |
+        status=0
+        for t in unprivileged.sh seccomp-mode-change.sh; do
+          if [ ! -e "test/cuda-checkpoint/$t" ]; then
+            echo "test/cuda-checkpoint/$t is not in this tree"
+            continue
+          fi
+          sudo "./test/cuda-checkpoint/$t" 2>&1 | tee "$RUNNER_TEMP/logs/$t.txt" || status=1
+        done
+        exit "$status"
+
+    - name: Summary
+      if: always()
+      run: |
+        sudo chown -R "$(id -u):$(id -g)" "$RUNNER_TEMP/logs"
+        {
+          echo "### ${{ matrix.os }}, kernel $(uname -r)"
+          for f in "$RUNNER_TEMP"/logs/*.txt; do
+            [ -e "$f" ] || continue
+            echo "#### $(basename "$f")"
+            echo '```'
+            grep -E "Test zdtm/.* (PASS|FAIL)|^Skipping|TEST\(S\)|^ \* |PASS$|SKIP|failed with|CRIU can|CRIU cannot" "$f" || :
+            echo '```'
+          done
+        } >> "$GITHUB_STEP_SUMMARY"
+
+    - name: Upload the logs
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: cuda-seccomp-logs-${{ matrix.os }}
+        path: |
+          ${{ runner.temp }}/logs/*.txt
+          ${{ runner.temp }}/logs/**/*.log
